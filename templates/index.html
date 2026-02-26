@@ -1,500 +1,496 @@
-"""
-=======================================================================
-  main.py  —  SRE Log Analyzer (Gemini version)
-=======================================================================
-
-WHAT CHANGED FROM THE ANTHROPIC VERSION:
-
-  OLD (Anthropic):
-    import anthropic
-    client = anthropic.Anthropic(api_key=...)
-    client.messages.stream(model="claude-opus-4-5", ...)
-
-  NEW (Google Gemini):
-    import google.generativeai as genai
-    genai.configure(api_key=...)
-    model = genai.GenerativeModel("gemini-1.5-flash")
-    model.generate_content(..., stream=True)
-
-  Everything else — FastAPI, Pydantic, New Relic, streaming,
-  the frontend — stays exactly the same.
-  This is the power of clean architecture: swap one piece,
-  rest of the system doesn't care.
-
-HOW TO GET YOUR GEMINI API KEY:
-  1. Go to https://aistudio.google.com
-  2. Click "Get API key" → "Create API key"
-  3. Copy it (starts with "AIza...")
-  4. Set: export GEMINI_API_KEY="AIza..."
-
-GEMINI MODELS AVAILABLE (free tier):
-  gemini-1.5-flash  → Fastest, free, great for most tasks
-  gemini-1.5-pro    → Smarter, free up to 2 req/min
-  gemini-2.0-flash  → Latest, fast, free tier available
-
-  We use gemini-1.5-pro by default — best quality for SRE analysis.
-  Switch to gemini-1.5-flash if you want faster responses.
-=======================================================================
-"""
-
-import os
-import json
-import hmac
-import hashlib
-from datetime import datetime
-from typing import AsyncGenerator
-
-# ── Gemini import ─────────────────────────────────────────────────────
-# pip install google-generativeai
-import google.generativeai as genai
-
-# FastAPI imports (unchanged)
-from fastapi import FastAPI, HTTPException, Request, Header
-from fastapi.responses import StreamingResponse, HTMLResponse
-from fastapi.templating import Jinja2Templates
-from pydantic import BaseModel, Field
-
-
-# ── App setup (unchanged) ─────────────────────────────────────────────
-app = FastAPI(
-    title="SRE Log Analyzer",
-    description="""
-## AI-powered SRE tool — powered by Google Gemini
-
-### Features
-- **Log Analysis** — paste logs, get root cause + fix
-- **New Relic Integration** — receive alerts via webhook, auto-analyzed by Gemini
-- **Streaming** — responses appear word-by-word
-
-### Endpoints
-- `POST /analyze` — stream log analysis
-- `POST /chat` — follow-up questions
-- `POST /newrelic/simulate` — fire a test alert
-- `POST /newrelic/webhook` — real New Relic alerts
-- `GET  /health` — health check
-    """,
-    version="2.0.0",
-)
-
-templates = Jinja2Templates(directory="templates")
-
-# ── Gemini client setup ───────────────────────────────────────────────
-# This replaces: client = anthropic.Anthropic(api_key=...)
-# genai.configure sets the API key globally for all Gemini calls
-genai.configure(api_key=os.environ.get("GEMINI_API_KEY", ""))
-
-# Create model instances
-# GenerativeModel is the equivalent of Anthropic's client
-# We create two: one for log analysis, one for New Relic alerts
-# This lets us give each a different "personality" via system_instruction
-
-log_model = genai.GenerativeModel(
-    model_name="gemini-2.5-flash",
-
-    # system_instruction = Gemini's version of Anthropic's "system" prompt
-    # This tells Gemini WHO it is and HOW to behave for all conversations
-    system_instruction="""You are an expert SRE (Site Reliability Engineer) with 10 years of experience at top tech companies.
-Analyze logs and always respond in this exact markdown format:
-
-## 🔴 Root Cause
-[One clear sentence explaining what went wrong]
-
-## 📊 Severity
-**[CRITICAL/HIGH/MEDIUM/LOW]** — [One sentence on business impact]
-
-## 🔍 Key Evidence
-[Bullet list of the specific log lines that prove your diagnosis]
-
-## 🛠️ Immediate Fix
-[Numbered step-by-step fix — be specific, include actual commands]
-
-## 🛡️ Prevention
-[2-3 concrete actions to prevent recurrence]
-
-Be direct. No fluff. If asked follow-up questions, remember the logs you already analyzed."""
-)
-
-newrelic_model = genai.GenerativeModel(
-    model_name="gemini-2.5-flash",
-    system_instruction="""You are an expert SRE analyzing a New Relic alert.
-Always respond in this exact markdown format:
-
-## 🚨 Diagnosis
-[One sentence: what is happening and why]
-
-## 📊 Severity Assessment
-**[CRITICAL/HIGH/MEDIUM/LOW]** — [User/business impact]
-
-## 🔍 What New Relic Is Telling Us
-[Plain English explanation of the metrics and thresholds]
-
-## 🛠️ Immediate Actions
-[Numbered steps with specific commands]
-
-## 📈 Metrics to Watch
-[Which New Relic metrics confirm the fix is working]
-
-## 🛡️ Long-term Fix
-[Permanent solution in 1-2 sentences]
-
-Be specific. Include real commands. No fluff."""
-)
-
-# In-memory alert store
-recent_alerts: list[dict] = []
-
-
-# ── Pydantic models (unchanged) ───────────────────────────────────────
-
-class LogAnalysisRequest(BaseModel):
-    logs: str = Field(
-        ..., min_length=10,
-        description="Raw log text to analyze",
-        example="2024-01-15 14:23:06 ERROR [payment-service] Connection timeout after 5000ms"
-    )
-    class Config:
-        json_schema_extra = {"example": {"logs": "2024-01-15 ERROR [payment-service] DB connection timeout\n2024-01-15 ERROR All retries exhausted."}}
-
-
-class ChatRequest(BaseModel):
-    history: list[dict] = Field(default=[], description="Previous messages")
-    question: str = Field(..., min_length=1, description="Follow-up question",
-                          example="Give me the exact kubectl command to fix this")
-
-
-class SimulateAlertRequest(BaseModel):
-    scenario: str = Field(
-        default="high_error_rate",
-        description="Scenario: high_error_rate | slow_response | memory_leak | apdex_drop"
-    )
-
-
-# ── Gemini streaming helpers ──────────────────────────────────────────
-#
-# HOW GEMINI STREAMING DIFFERS FROM ANTHROPIC:
-#
-# Anthropic:
-#   with client.messages.stream(...) as stream:
-#       for chunk in stream.text_stream:
-#
-# Gemini:
-#   response = model.generate_content(..., stream=True)
-#   for chunk in response:
-#       chunk.text  ← the text piece
-#
-# The concept is identical — we just call different methods.
-
-def convert_history_to_gemini(history: list[dict]) -> list:
-    """
-    Convert our conversation history format to what Gemini expects.
-
-    Our format (same as Anthropic/OpenAI):
-      [{"role": "user", "content": "..."}, {"role": "assistant", "content": "..."}]
-
-    Gemini format:
-      [{"role": "user", "parts": ["..."]}, {"role": "model", "parts": ["..."]}]
-
-    Key differences:
-      - "content" → "parts" (and it's a list)
-      - "assistant" → "model" (Gemini calls it "model" not "assistant")
-    """
-    gemini_history = []
-    for msg in history:
-        role = "model" if msg["role"] == "assistant" else "user"
-        gemini_history.append({
-            "role": role,
-            "parts": [msg["content"]]
-        })
-    return gemini_history
-
-
-async def stream_gemini_response(
-    prompt: str,
-    model: genai.GenerativeModel,
-    history: list[dict] = None
-) -> AsyncGenerator[str, None]:
-    """
-    Stream Gemini's response as Server-Sent Events.
-
-    If history is provided, Gemini gets conversation context.
-    If not, it's a fresh single-turn conversation.
-    """
-    try:
-        if history:
-            # Multi-turn conversation: start a chat session with history
-            # This is Gemini's way of maintaining conversation context
-            gemini_history = convert_history_to_gemini(history[:-1])  # all but last
-            chat = model.start_chat(history=gemini_history)
-            # Send the last message (the new question)
-            last_message = history[-1]["content"]
-            response = chat.send_message(last_message, stream=True)
-        else:
-            # Single-turn: just generate from the prompt
-            response = model.generate_content(prompt, stream=True)
-
-        full_reply = ""
-        for chunk in response:
-            # chunk.text contains the text piece (may be empty for some chunks)
-            if chunk.text:
-                full_reply += chunk.text
-                yield f"data: {json.dumps({'text': chunk.text})}\n\n"
-
-        yield f"data: {json.dumps({'done': True, 'full_reply': full_reply})}\n\n"
-
-    except Exception as e:
-        error_msg = f"\n\n⚠️ Gemini error: {str(e)}"
-        yield f"data: {json.dumps({'text': error_msg})}\n\n"
-        yield f"data: {json.dumps({'done': True, 'full_reply': error_msg})}\n\n"
-
-
-def call_gemini_sync(prompt: str, model: genai.GenerativeModel) -> str:
-    """
-    Non-streaming Gemini call for webhook processing.
-    Returns the full response text.
-    """
-    try:
-        response = model.generate_content(prompt)
-        return response.text
-    except Exception as e:
-        return f"⚠️ Gemini analysis failed: {e}"
-
-
-# ── Routes ────────────────────────────────────────────────────────────
-
-@app.get("/", response_class=HTMLResponse, include_in_schema=False)
-async def index(request: Request):
-    return templates.TemplateResponse("index.html", {"request": request})
-
-
-@app.post(
-    "/analyze",
-    summary="Analyze logs with Gemini AI",
-    description="Send raw log text. Streams back root cause analysis word-by-word.",
-    tags=["Log Analysis"]
-)
-async def analyze(body: LogAnalysisRequest):
-    prompt = f"Analyze these logs and find the root cause:\n\n{body.logs}"
-
-    return StreamingResponse(
-        stream_gemini_response(prompt, log_model),
-        media_type="text/event-stream",
-        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"}
-    )
-
-
-@app.post(
-    "/chat",
-    summary="Follow-up questions with conversation memory",
-    description="Ask follow-up questions. Pass conversation history so Gemini remembers context.",
-    tags=["Log Analysis"]
-)
-async def chat(body: ChatRequest):
-    # Build full message list including the new question
-    messages = body.history + [{"role": "user", "content": body.question}]
-
-    return StreamingResponse(
-        stream_gemini_response(body.question, log_model, history=messages),
-        media_type="text/event-stream",
-        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"}
-    )
-
-
-# ── New Relic integration (logic unchanged, just swapped AI call) ─────
-
-def verify_signature(body: bytes, header: str) -> bool:
-    secret = os.environ.get("NEWRELIC_WEBHOOK_SECRET", "")
-    if not secret:
-        return True
-    expected = hmac.new(secret.encode(), body, hashlib.sha256).hexdigest()
-    return hmac.compare_digest(f"sha256={expected}", header or "")
-
-
-def format_alert_prompt(alert: dict) -> str:
-    thresholds = "\n".join(
-        f"  - {t.get('name','?')}: {t.get('value','?')} "
-        f"(threshold: {t.get('threshold','?')} for {t.get('duration','?')} min)"
-        for t in alert.get("thresholds", [])
-    ) or "  No threshold data"
-
-    return f"""New Relic Alert Fired:
-
-Alert:      {alert.get('alertName', 'Unknown')}
-Policy:     {alert.get('policyName', 'Unknown')}
-Entity:     {alert.get('entityName', 'Unknown')} ({alert.get('entityType', '')})
-Priority:   {alert.get('priority', 'Unknown')}
-State:      {alert.get('currentState', 'Unknown')}
-Time:       {alert.get('openTime', 'Unknown')}
-
-Violated Thresholds:
-{thresholds}
-
-Current value:   {alert.get('metricValue', 'N/A')}
-Threshold value: {alert.get('thresholdValue', 'N/A')}
-
-Context: {alert.get('details', 'None provided.')}"""
-
-
-def store_alert(alert: dict, diagnosis: str, source: str) -> dict:
-    record = {
-        "id": f"{source[:3]}-{len(recent_alerts)+1:04d}",
-        "received_at": datetime.utcnow().strftime("%H:%M:%S UTC"),
-        "source": source,
-        "alert_name": alert.get("alertName", "Unknown"),
-        "policy": alert.get("policyName", ""),
-        "entity": alert.get("entityName", "Unknown"),
-        "priority": alert.get("priority", "MEDIUM").upper(),
-        "state": alert.get("currentState", "open"),
-        "metric_value": alert.get("metricValue", "N/A"),
-        "threshold_value": alert.get("thresholdValue", "N/A"),
-        "ai_diagnosis": diagnosis,
-        "raw_alert": alert,
-    }
-    recent_alerts.insert(0, record)
-    if len(recent_alerts) > 20:
-        recent_alerts.pop()
-    return record
-
-
-SCENARIOS = {
-    "high_error_rate": {
-        "alertName": "High Error Rate — payment-service",
-        "policyName": "Production SLO Policy",
-        "conditionName": "Error rate exceeds 5%",
-        "entityName": "payment-service", "entityType": "APPLICATION",
-        "currentState": "open", "previousState": "closed", "priority": "CRITICAL",
-        "metricValue": "18.3", "thresholdValue": "5.0",
-        "accountName": "Acme Corp Production",
-        "alertUrl": "https://alerts.newrelic.com/accounts/123/incidents/456",
-        "details": "Error rate spiked to 18.3% (threshold: 5%). Began ~4 min ago. Recent deploy: v2.4.1 deployed 45 min ago.",
-        "thresholds": [{"name": "Error Rate", "value": "18.3%", "operator": ">", "threshold": "5%", "duration": "5"}]
-    },
-    "slow_response": {
-        "alertName": "Latency Degradation — api-gateway",
-        "policyName": "Production SLO Policy",
-        "conditionName": "p99 response time exceeds 2000ms",
-        "entityName": "api-gateway", "entityType": "APPLICATION",
-        "currentState": "open", "previousState": "closed", "priority": "HIGH",
-        "metricValue": "4230", "thresholdValue": "2000",
-        "accountName": "Acme Corp Production",
-        "alertUrl": "https://alerts.newrelic.com/accounts/123/incidents/457",
-        "details": "p99 latency 4230ms (2x threshold). p50 normal at 890ms. postgres-primary query latency up from 12ms to 3400ms p99.",
-        "thresholds": [{"name": "Response Time p99", "value": "4230ms", "operator": ">", "threshold": "2000ms", "duration": "3"}]
-    },
-    "memory_leak": {
-        "alertName": "Memory Usage Critical — order-service",
-        "policyName": "Infrastructure Policy",
-        "conditionName": "Host memory exceeds 90%",
-        "entityName": "order-service-pod-7d9f8b", "entityType": "HOST",
-        "currentState": "open", "previousState": "closed", "priority": "HIGH",
-        "metricValue": "94.2", "thresholdValue": "90.0",
-        "accountName": "Acme Corp Production",
-        "alertUrl": "https://alerts.newrelic.com/accounts/123/incidents/458",
-        "details": "Memory grew steadily 62% → 94.2% over 90 min, no traffic increase. Classic memory leak. GC pauses increasing. Pod uptime: 6h.",
-        "thresholds": [{"name": "Memory Used %", "value": "94.2%", "operator": ">", "threshold": "90%", "duration": "10"}]
-    },
-    "apdex_drop": {
-        "alertName": "Apdex Score Drop — checkout-service",
-        "policyName": "User Experience Policy",
-        "conditionName": "Apdex score below 0.7",
-        "entityName": "checkout-service", "entityType": "APPLICATION",
-        "currentState": "open", "previousState": "closed", "priority": "CRITICAL",
-        "metricValue": "0.41", "thresholdValue": "0.70",
-        "accountName": "Acme Corp Production",
-        "alertUrl": "https://alerts.newrelic.com/accounts/123/incidents/459",
-        "details": "Apdex dropped 0.94 → 0.41. 59% of users degraded. Error rate 8.2%. Correlates with DB migration at 14:05 UTC.",
-        "thresholds": [{"name": "Apdex Score", "value": "0.41", "operator": "<", "threshold": "0.70", "duration": "5"}]
-    }
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+<title>SRE AGENT | Log Analysis & Webhooks</title>
+<link rel="preconnect" href="https://fonts.googleapis.com"/>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet"/>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/marked/9.1.6/marked.min.js"></script>
+<style>
+:root {
+  --bg:       #000000;
+  --surface:  #0a0a0a;
+  --surface2: #141414;
+  --border:   #222222;
+  --border-hover: #333333;
+  --green:    #2ecc71;
+  --cyan:     #3498db;
+  --red:      #e74c3c;
+  --yellow:   #f1c40f;
+  --dim:      #888888;
+  --text:     #eaeaea;
+  --white:    #ffffff;
+  --mono:     'JetBrains Mono', monospace;
+  --display:  'Inter', sans-serif;
+}
+*, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+html, body { height: 100%; overflow: hidden; }
+
+body {
+  background: var(--bg); color: var(--text);
+  font-family: var(--display); font-size: 14px;
+  display: flex; flex-direction: column; height: 100vh;
+  -webkit-font-smoothing: antialiased;
 }
 
+/* ── Topbar ── */
+.topbar {
+  position: relative; z-index: 10;
+  display: flex; align-items: center; justify-content: space-between;
+  padding: 0 24px; height: 56px;
+  background: rgba(10, 10, 10, 0.8);
+  backdrop-filter: blur(12px);
+  border-bottom: 1px solid var(--border);
+  flex-shrink: 0;
+}
 
-@app.post(
-    "/newrelic/webhook",
-    summary="Receive real New Relic alert webhook",
-    description="Configure this URL in New Relic: Alerts → Channels → Webhook → paste this URL.",
-    tags=["New Relic Integration"]
-)
-async def newrelic_webhook(
-    request: Request,
-    x_nr_webhook_signature: str = Header(default="")
-):
-    body = await request.body()
-    if not verify_signature(body, x_nr_webhook_signature):
-        raise HTTPException(status_code=401, detail="Invalid webhook signature")
+.brand { display: flex; align-items: center; gap: 12px; }
+.brand-icon {
+  width: 28px; height: 28px;
+  background: var(--surface2); border: 1px solid var(--border);
+  border-radius: 6px; display: flex; align-items: center; justify-content: center; font-size: 14px;
+}
+.brand-name { font-weight: 600; font-size: 15px; color: var(--white); letter-spacing: 0.5px; }
+.brand-tag  { font-size: 11px; color: var(--dim); font-weight: 500; }
 
-    try:
-        alert = await request.json()
-    except Exception:
-        raise HTTPException(status_code=400, detail="Invalid JSON")
+.topbar-right { display: flex; align-items: center; gap: 16px; }
+.status-pill { display: flex; align-items: center; gap: 8px; font-size: 12px; font-weight: 500; color: var(--dim); }
+.status-dot { width: 8px; height: 8px; border-radius: 50%; background: var(--dim); transition: all .3s; }
+.status-dot.ready { background: var(--green); box-shadow: 0 0 8px rgba(46,204,113,0.4); }
+.status-dot.busy  { background: var(--cyan);  box-shadow: 0 0 8px rgba(52,152,219,0.4); animation: pulse 1.5s infinite; }
+.status-dot.error { background: var(--red);   box-shadow: 0 0 8px rgba(231,76,60,0.4); }
+@keyframes pulse { 0%,100% { opacity:1; } 50% { opacity:.4; } }
 
-    if not alert:
-        raise HTTPException(status_code=400, detail="Empty payload")
+/* ── Tab bar ── */
+.tabbar {
+  display: flex; align-items: center; gap: 24px;
+  background: var(--bg); border-bottom: 1px solid var(--border);
+  padding: 0 24px; flex-shrink: 0;
+}
 
-    # Only change: call_gemini_sync instead of run_claude_sync
-    diagnosis = call_gemini_sync(format_alert_prompt(alert), newrelic_model)
-    record = store_alert(alert, diagnosis, source="newrelic")
+.tab {
+  padding: 14px 0; font-size: 13px; font-weight: 500;
+  color: var(--dim); cursor: pointer;
+  border-bottom: 2px solid transparent; transition: all .2s;
+  position: relative; top: 1px;
+}
+.tab:hover { color: var(--text); }
+.tab.active { color: var(--white); border-bottom-color: var(--white); }
+.tab .tab-count {
+  display: inline-flex; align-items: center; justify-content: center;
+  width: 20px; height: 20px; background: var(--surface2); border: 1px solid var(--border);
+  border-radius: 10px; font-size: 11px; color: var(--text); margin-left: 8px;
+}
 
-    return {"status": "received", "alert_id": record["id"]}
+/* ── Main content & Layout Grid ── */
+.content { flex: 1; overflow: hidden; position: relative; }
 
+/* CRITICAL FIX: Ensure grid is respected when panel is active */
+.panel { display: none !important; height: 100%; }
+.panel.active { display: grid !important; }
+.split-layout { grid-template-columns: 400px 1fr; width: 100%; height: 100%; }
 
-@app.post(
-    "/newrelic/simulate",
-    summary="Simulate a New Relic alert (demo)",
-    description="Valid scenarios: high_error_rate | slow_response | memory_leak | apdex_drop",
-    tags=["New Relic Integration"]
-)
-async def simulate_alert(body: SimulateAlertRequest):
-    if body.scenario not in SCENARIOS:
-        raise HTTPException(
-            status_code=400,
-            detail=f"Unknown scenario. Valid: {list(SCENARIOS.keys())}"
-        )
-    payload = {
-        **SCENARIOS[body.scenario],
-        "openTime": datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
+/* ── Standardized Column Structure ── */
+.left-col { 
+  display: flex; flex-direction: column; 
+  border-right: 1px solid var(--border); background: var(--surface); 
+  height: 100%; overflow: hidden; 
+}
+.right-col { 
+  display: flex; flex-direction: column; background: var(--bg); 
+  height: 100%; overflow: hidden; 
+}
+
+.col-header {
+  display: flex; align-items: center; justify-content: space-between;
+  padding: 0 24px; height: 64px; border-bottom: 1px solid var(--border);
+  flex-shrink: 0; background: var(--surface);
+}
+.col-title { font-size: 13px; font-weight: 600; color: var(--text); margin: 0; text-transform: uppercase; letter-spacing: 0.5px; }
+
+.col-body { flex: 1; display: flex; flex-direction: column; overflow-y: auto; min-height: 0; }
+
+.col-footer {
+  padding: 20px 24px; border-top: 1px solid var(--border);
+  flex-shrink: 0; background: var(--surface);
+}
+
+/* ── UI Components ── */
+.primary-btn {
+  width: 100%; padding: 14px; font-weight: 600; font-size: 14px;
+  background: var(--text); color: var(--bg); border: none;
+  border-radius: 8px; cursor: pointer; transition: transform .1s, opacity .2s;
+}
+.primary-btn:hover { transform: translateY(-1px); opacity: 0.9; }
+.primary-btn:disabled { opacity: 0.5; cursor: not-allowed; transform: none; }
+
+.sample-btns { display: flex; gap: 8px; }
+.sample-btn {
+  font-family: var(--display); font-size: 11px; font-weight: 500;
+  padding: 6px 12px; background: var(--bg);
+  border: 1px solid var(--border); color: var(--text);
+  border-radius: 4px; cursor: pointer; transition: all .2s;
+}
+.sample-btn:hover { background: var(--border); color: var(--white); }
+
+/* Textarea for Logs */
+.custom-textarea {
+  flex: 1; background: var(--bg); border: 1px solid var(--border);
+  border-radius: 8px; color: var(--text); font-family: var(--mono);
+  font-size: 13px; line-height: 1.6; padding: 16px;
+  resize: none; outline: none; transition: border-color .2s; min-height: 0;
+}
+.custom-textarea:focus { border-color: var(--dim); }
+.custom-textarea::placeholder { color: var(--dim); }
+
+/* Webhook Simulator Buttons */
+.fire-btns { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+.fire-btn {
+  padding: 16px; background: var(--bg); border: 1px solid var(--border);
+  border-radius: 8px; cursor: pointer; text-align: left; transition: all .2s;
+}
+.fire-btn:hover { border-color: var(--border-hover); background: var(--surface2); transform: translateY(-1px); }
+.btn-name { display: block; font-weight: 600; font-size: 12px; color: var(--white); margin-bottom: 6px; }
+.btn-desc { display: block; font-size: 11px; color: var(--dim); }
+
+/* Webhook URL Copy */
+.webhook-label { font-size: 11px; font-weight: 500; color: var(--dim); margin-bottom: 8px; text-transform: uppercase; letter-spacing: 0.5px; }
+.webhook-url { background: var(--bg); border: 1px dashed var(--border); border-radius: 6px; padding: 12px; font-family: var(--mono); font-size: 12px; color: var(--dim); cursor: pointer; transition: all 0.2s; }
+.webhook-url:hover { color: var(--white); border-color: var(--dim); }
+
+/* Alert List */
+.alert-list-wrap { flex: 1; overflow-y: auto; min-height: 0; }
+.alert-item { padding: 16px 24px; border-bottom: 1px solid var(--border); cursor: pointer; transition: background .2s; }
+.alert-item:hover { background: var(--surface2); }
+.alert-item.selected { background: var(--surface2); box-shadow: inset 3px 0 0 var(--white); }
+.alert-item-header { display: flex; align-items: center; gap: 10px; margin-bottom: 6px; }
+
+.prio-dot { width: 8px; height: 8px; border-radius: 50%; }
+.prio-dot.CRITICAL { background: var(--red); }
+.prio-dot.HIGH     { background: var(--yellow); }
+.prio-dot.MEDIUM   { background: var(--cyan); }
+.alert-name { font-size: 13px; font-weight: 500; color: var(--white); flex: 1; }
+.alert-meta { font-size: 12px; color: var(--dim); }
+
+/* ── Right Column Content ── */
+.output-area, .nr-detail { flex: 1; overflow-y: auto; padding: 40px 48px; min-height: 0; }
+.output-area::-webkit-scrollbar, .nr-detail::-webkit-scrollbar, .col-body::-webkit-scrollbar { width: 6px; }
+.output-area::-webkit-scrollbar-thumb, .nr-detail::-webkit-scrollbar-thumb, .col-body::-webkit-scrollbar-thumb { background: var(--border-hover); border-radius: 3px; }
+
+.empty-state { display: flex; flex-direction: column; align-items: center; justify-content: center; height: 100%; color: var(--dim); text-align: center; }
+.empty-state h3 { font-size: 16px; font-weight: 500; color: var(--white); margin-bottom: 8px; }
+
+/* Chat UI */
+.message { margin-bottom: 32px; animation: fadeIn .4s ease; }
+@keyframes fadeIn { from { opacity:0; transform:translateY(10px); } to { opacity:1; transform:translateY(0); } }
+
+.msg-label { font-size: 12px; font-weight: 600; margin-bottom: 8px; color: var(--dim); text-transform: uppercase; letter-spacing: 0.5px; }
+.msg-body { font-size: 14px; line-height: 1.6; color: var(--text); }
+.msg-body.user-body { 
+  font-family: var(--mono); font-size: 13px; color: var(--dim); 
+  padding: 16px 20px; background: var(--surface); 
+  border: 1px solid var(--border); border-radius: 8px; 
+  max-height: 200px; overflow-y: auto;
+}
+
+.msg-body h2 { font-size: 16px; font-weight: 600; color: var(--white); margin: 24px 0 12px; border-bottom: 1px solid var(--border); padding-bottom: 8px; }
+.msg-body h2:first-child { margin-top: 0; }
+.msg-body p { margin-bottom: 16px; }
+.msg-body code { font-family: var(--mono); font-size: 13px; background: var(--surface2); padding: 2px 6px; border-radius: 4px; border: 1px solid var(--border); }
+.msg-body pre { background: var(--surface2); border: 1px solid var(--border); border-radius: 8px; padding: 16px; overflow-x: auto; margin: 16px 0; }
+.msg-body pre code { border: none; padding: 0; background: transparent; }
+.msg-body ul, .msg-body ol { margin: 0 0 16px 24px; }
+.msg-body li { margin-bottom: 8px; }
+
+.chat-bar { padding: 16px 48px; border-top: 1px solid var(--border); background: var(--surface); display: none; gap: 12px; flex-shrink: 0; }
+.chat-bar.visible { display: flex; }
+#chatInput { flex: 1; background: var(--bg); border: 1px solid var(--border); border-radius: 6px; padding: 12px 16px; color: var(--text); outline: none; font-size: 14px; }
+#chatInput:focus { border-color: var(--dim); }
+
+/* New Relic Alert Detail Cards */
+.alert-header-card { background: var(--surface); border: 1px solid var(--border); border-radius: 12px; padding: 24px; margin-bottom: 32px; }
+.alert-title-text { font-size: 18px; font-weight: 600; color: var(--white); margin-bottom: 20px; }
+.alert-meta-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 24px; }
+.meta-item label { display: block; font-size: 11px; font-weight: 500; color: var(--dim); margin-bottom: 6px; text-transform: uppercase; letter-spacing: 0.5px; }
+.meta-item span { font-size: 14px; font-weight: 500; color: var(--text); }
+.metric-highlight { color: var(--red) !important; font-size: 16px !important; }
+
+.ai-card-header { font-size: 14px; font-weight: 600; color: var(--white); margin-bottom: 16px; display: flex; align-items: center; gap: 8px; text-transform: uppercase; letter-spacing: 0.5px; }
+.ai-card-header::before { content: '✨'; }
+</style>
+</head>
+<body>
+
+<div class="topbar">
+  <div class="brand">
+    <div class="brand-icon">⚡</div>
+    <div class="brand-name">SRE AGENT</div>
+    <div class="brand-tag">Analysis Engine</div>
+  </div>
+  <div class="topbar-right">
+    <div class="status-pill">
+      <div class="status-dot ready" id="statusDot"></div>
+      <span id="statusText">System Ready</span>
+    </div>
+  </div>
+</div>
+
+<div class="tabbar">
+  <div class="tab active" id="tab-logs" onclick="switchTab('logs')">Log Analyzer</div>
+  <div class="tab" id="tab-newrelic" onclick="switchTab('newrelic')">
+    New Relic Webhooks
+    <span class="tab-count" id="alertCount" style="display:none">0</span>
+  </div>
+</div>
+
+<div class="content">
+  
+  <div class="panel active split-layout" id="panel-logs">
+    
+    <div class="left-col">
+      <div class="col-header">
+        <h3 class="col-title">Raw Telemetry Input</h3>
+        <div class="sample-btns">
+          <button class="sample-btn" onclick="loadSample('db')">DB Timeout</button>
+          <button class="sample-btn" onclick="loadSample('oom')">OOM</button>
+        </div>
+      </div>
+      <div class="col-body" style="padding: 24px;">
+        <textarea id="logInput" class="custom-textarea" placeholder="Paste your application logs here..."></textarea>
+      </div>
+      <div class="col-footer">
+        <button class="primary-btn" id="analyzeBtn" onclick="analyze()">Run Diagnosis</button>
+      </div>
+    </div>
+    
+    <div class="right-col">
+      <div class="output-area" id="outputArea">
+        <div class="empty-state" id="emptyState">
+          <h3>Awaiting Logs</h3>
+          <p>Paste your trace data on the left to generate an AI root-cause analysis.</p>
+        </div>
+      </div>
+      <div class="chat-bar" id="chatBar">
+        <input type="text" id="chatInput" placeholder="Ask a follow-up question..." onkeydown="if(event.key==='Enter') sendChat()"/>
+        <button class="primary-btn" style="width:auto; padding: 12px 24px; margin:0;" id="sendBtn" onclick="sendChat()">Send</button>
+      </div>
+    </div>
+    
+  </div>
+
+  <div class="panel split-layout" id="panel-newrelic">
+    
+    <div class="left-col">
+      <div class="col-header">
+        <h3 class="col-title">Simulate Webhook</h3>
+      </div>
+      <div class="col-body">
+        <div style="padding: 24px; border-bottom: 1px solid var(--border); flex-shrink: 0;">
+          <div class="fire-btns">
+            <button class="fire-btn" onclick="fireAlert('high_error_rate')">
+              <span class="btn-name">High Error Rate</span>
+              <span class="btn-desc">payment-service</span>
+            </button>
+            <button class="fire-btn" onclick="fireAlert('slow_response')">
+              <span class="btn-name">Latency Spike</span>
+              <span class="btn-desc">api-gateway</span>
+            </button>
+            <button class="fire-btn" onclick="fireAlert('memory_leak')">
+              <span class="btn-name">Memory Leak</span>
+              <span class="btn-desc">order-service</span>
+            </button>
+            <button class="fire-btn" onclick="fireAlert('apdex_drop')">
+              <span class="btn-name">Apdex Drop</span>
+              <span class="btn-desc">checkout-service</span>
+            </button>
+          </div>
+        </div>
+        <div class="alert-list-wrap" id="alertListWrap">
+          <div class="empty-state" id="alertListEmpty" style="padding: 40px;">
+            <p>No active alerts.</p>
+          </div>
+        </div>
+      </div>
+      <div class="col-footer">
+        <div class="webhook-label">Live Webhook URL</div>
+        <div class="webhook-url" id="webhookUrl" onclick="copyWebhookUrl()">Loading...</div>
+      </div>
+    </div>
+    
+    <div class="right-col">
+      <div class="nr-detail" id="nrDetail" style="display:none"></div>
+      <div class="empty-state" id="nrDetailEmpty">
+        <h3>Select an Alert</h3>
+        <p>Review the automated AI diagnosis for incoming telemetry.</p>
+      </div>
+    </div>
+    
+  </div>
+
+</div>
+
+<script>
+const SAMPLES = {
+  db: `2024-01-15 14:23:01 INFO  [payment-service] Processing payment id=PAY-9921
+2024-01-15 14:23:01 INFO  [payment-service] Connecting to db host=db-primary port=5432
+2024-01-15 14:23:06 ERROR [payment-service] Connection timeout after 5000ms host=db-primary
+2024-01-15 14:23:06 WARN  [payment-service] Retrying connection attempt=1/3
+2024-01-15 14:23:11 ERROR [payment-service] Connection timeout after 5000ms host=db-primary
+2024-01-15 14:23:16 ERROR [payment-service] All retries exhausted. Database unreachable.
+2024-01-15 14:23:16 ERROR [payment-service] Payment PAY-9921 FAILED — returning 500 to client`,
+  oom: `2024-01-16 09:11:42 INFO  [order-service] Starting up, heap_max=512MB
+2024-01-16 09:51:02 WARN  [order-service] Heap usage 91% used=466MB max=512MB
+2024-01-16 09:53:01 ERROR [order-service] java.lang.OutOfMemoryError: Java heap space
+2024-01-16 09:53:02 ERROR [k8s] Pod order-service-7d9f8b-xk2p9 crashed: OOMKilled`
+};
+
+let conversationHistory = []; let isStreaming = false; let selectedAlertId = null; let allAlerts = [];
+
+document.addEventListener('DOMContentLoaded', () => {
+  document.getElementById('webhookUrl').textContent = window.location.origin + '/newrelic/webhook';
+  setInterval(pollAlerts, 4000);
+});
+
+function switchTab(tab) {
+  document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
+  document.querySelectorAll('.panel').forEach(p => p.classList.remove('active'));
+  document.getElementById('tab-' + tab).classList.add('active');
+  document.getElementById('panel-' + tab).classList.add('active');
+}
+
+function loadSample(key) { document.getElementById('logInput').value = SAMPLES[key]; }
+
+function setStatus(state, text) {
+  document.getElementById('statusDot').className = 'status-dot ' + state;
+  document.getElementById('statusText').textContent = text;
+}
+
+function createMessage(role) {
+  const area = document.getElementById('outputArea');
+  document.getElementById('emptyState')?.remove();
+  const msg = document.createElement('div'); msg.className = 'message';
+  const label = document.createElement('div'); label.className = 'msg-label';
+  label.textContent = role === 'user' ? 'Telemetry Input' : 'AI Analysis';
+  const body = document.createElement('div'); body.className = 'msg-body' + (role === 'user' ? ' user-body' : '');
+  msg.appendChild(label); msg.appendChild(body); area.appendChild(msg);
+  area.scrollTop = area.scrollHeight; return body;
+}
+
+async function streamIntoElement(response, bodyEl) {
+  const reader = response.body.getReader(); const decoder = new TextDecoder(); let raw = '';
+  while (true) {
+    const { done, value } = await reader.read(); if (done) break;
+    for (const line of decoder.decode(value).split('\n')) {
+      if (!line.startsWith('data: ')) continue;
+      try {
+        const d = JSON.parse(line.slice(6));
+        if (d.done) { bodyEl.innerHTML = marked.parse(raw); return d.full_reply || raw; }
+        if (d.text) { raw += d.text; bodyEl.innerHTML = marked.parse(raw); document.getElementById('outputArea').scrollTop = 99999; }
+      } catch(e) {}
     }
-    diagnosis = call_gemini_sync(format_alert_prompt(payload), newrelic_model)
-    record = store_alert(payload, diagnosis, source="simulated")
-    return {"status": "simulated", "alert_id": record["id"]}
+  }
+  return raw;
+}
 
+async function analyze() {
+  const logs = document.getElementById('logInput').value.trim();
+  if (!logs || isStreaming) return;
+  isStreaming = true; conversationHistory = [];
+  document.getElementById('analyzeBtn').disabled = true; document.getElementById('outputArea').innerHTML = '';
+  setStatus('busy', 'Analyzing...');
+  const userBody = createMessage('user'); userBody.textContent = logs.slice(0,300) + (logs.length>300 ? '\n...' : '');
+  const aiBody = createMessage('ai');
+  try {
+    const res = await fetch('/analyze', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify({ logs }) });
+    const reply = await streamIntoElement(res, aiBody);
+    conversationHistory.push({role:'user', content:logs}, {role:'assistant', content: reply});
+    document.getElementById('chatBar').className = 'chat-bar visible'; setStatus('ready', 'Ready');
+  } catch(e) { aiBody.textContent = '❌ Error'; setStatus('error', 'Error'); }
+  isStreaming = false; document.getElementById('analyzeBtn').disabled = false;
+}
 
-@app.get(
-    "/newrelic/alerts",
-    summary="Get recent alerts",
-    tags=["New Relic Integration"]
-)
-async def get_alerts():
-    return {"alerts": recent_alerts}
+async function sendChat() {
+  const input = document.getElementById('chatInput'); const q = input.value.trim();
+  if (!q || isStreaming) return; input.value = ''; isStreaming = true;
+  document.getElementById('sendBtn').disabled = true; setStatus('busy', 'Thinking...');
+  const userBody = createMessage('user'); userBody.textContent = q; const aiBody = createMessage('ai');
+  try {
+    const res = await fetch('/chat', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify({ history: conversationHistory, question: q }) });
+    const reply = await streamIntoElement(res, aiBody);
+    conversationHistory.push({role:'user', content:q}, {role:'assistant', content:reply});
+    setStatus('ready', 'Ready');
+  } catch(e) { aiBody.textContent = '❌ Error'; setStatus('error', 'Error'); }
+  isStreaming = false; document.getElementById('sendBtn').disabled = false;
+}
 
+function copyWebhookUrl() {
+  const url = window.location.origin + '/newrelic/webhook';
+  navigator.clipboard.writeText(url).then(() => {
+    const el = document.getElementById('webhookUrl'); el.textContent = '✓ Copied!';
+    setTimeout(() => { el.textContent = url; }, 2000);
+  });
+}
 
-@app.get(
-    "/newrelic/alerts/{alert_id}",
-    summary="Get single alert by ID",
-    tags=["New Relic Integration"]
-)
-async def get_alert(alert_id: str):
-    alert = next((a for a in recent_alerts if a["id"] == alert_id), None)
-    if not alert:
-        raise HTTPException(status_code=404, detail=f"Alert '{alert_id}' not found")
-    return alert
+async function fireAlert(scenario) {
+  document.querySelectorAll('.fire-btn').forEach(b => b.disabled = true); setStatus('busy', 'Processing Webhook...');
+  switchTab('newrelic');
+  try {
+    const res = await fetch('/newrelic/simulate', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify({ scenario }) });
+    const data = await res.json(); await pollAlerts();
+    if (data.alert_id) selectAlert(data.alert_id);
+    setStatus('ready', 'Ready');
+  } catch(e) { setStatus('error', 'Error'); }
+  document.querySelectorAll('.fire-btn').forEach(b => b.disabled = false);
+}
 
-
-@app.get("/health", summary="Health check", tags=["System"])
-async def health():
-    return {
-        "status": "healthy",
-        "ai_provider": "Google Gemini",
-        "model": "gemini-2.5-flash",
-        "version": "2.0.0",
-        "timestamp": datetime.utcnow().isoformat(),
-        "gemini_configured": bool(os.environ.get("GEMINI_API_KEY"))
+async function pollAlerts() {
+  try {
+    const res = await fetch('/newrelic/alerts'); const data = await res.json(); const alerts = data.alerts || [];
+    const badge = document.getElementById('alertCount');
+    badge.textContent = alerts.length; badge.style.display = alerts.length ? 'inline-flex' : 'none';
+    if (JSON.stringify(alerts.map(a=>a.id)) !== JSON.stringify(allAlerts.map(a=>a.id))) {
+      allAlerts = alerts; renderAlertList(alerts);
     }
+  } catch(e) {}
+}
 
+function renderAlertList(alerts) {
+  const wrap = document.getElementById('alertListWrap');
+  document.getElementById('alertListEmpty').style.display = alerts.length ? 'none' : 'flex';
+  wrap.querySelectorAll('.alert-item').forEach(el => el.remove());
+  for (const a of alerts) {
+    const item = document.createElement('div');
+    item.className = 'alert-item' + (a.id === selectedAlertId ? ' selected' : '');
+    item.id = 'alert-item-' + a.id; item.onclick = () => selectAlert(a.id);
+    item.innerHTML = `<div class="alert-item-header"><div class="prio-dot ${a.priority}"></div><div class="alert-name">${esc(a.alert_name)}</div></div><div class="alert-meta">${esc(a.entity)} · ${a.received_at}</div>`;
+    wrap.appendChild(item);
+  }
+}
 
-if __name__ == "__main__":
-    import uvicorn
-    uvicorn.run(
-        "main:app",
-        host="0.0.0.0",
-        port=int(os.environ.get("PORT", 8000)),
-        reload=True
-    )
+function selectAlert(alertId) {
+  selectedAlertId = alertId;
+  document.querySelectorAll('.alert-item').forEach(el => el.classList.remove('selected'));
+  document.getElementById('alert-item-' + alertId)?.classList.add('selected');
+  const alert = allAlerts.find(a => a.id === alertId); if (!alert) return;
+  document.getElementById('nrDetailEmpty').style.display = 'none';
+  const detail = document.getElementById('nrDetail'); detail.style.display = 'block';
+  detail.innerHTML = `
+    <div class="alert-header-card">
+      <div class="alert-title-text">${esc(alert.alert_name)}</div>
+      <div class="alert-meta-grid">
+        <div class="meta-item"><label>Entity</label><span>${esc(alert.entity)}</span></div>
+        <div class="meta-item"><label>Current Value</label><span class="metric-highlight">${esc(alert.metric_value)}</span></div>
+        <div class="meta-item"><label>Threshold</label><span>${esc(alert.threshold_value)}</span></div>
+      </div>
+    </div>
+    <div class="msg-body">
+      <div class="ai-card-header">Diagnostic Report</div>
+      <div id="diagnosis-body">${marked.parse(alert.ai_diagnosis || 'Analyzing...')}</div>
+    </div>
+  `;
+}
+function esc(s) { return String(s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;'); }
+</script>
+</body>
+</html>
